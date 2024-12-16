@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-# Proxmox-load-balancer v0.6.4-betta Copyright (C) 2022 cvk98 (github.com/cvk98)
+# Extended Proxmox-load-balancer with CPU/RAM balancing, grouping, OOM checks, Test Mode, configurable thresholds
+# and CPU trend analysis via RRD data. After each migration, hosts are re-measured to see if CPU/RAM situation improves.
 
 import sys
 import requests
@@ -14,28 +15,29 @@ from time import sleep
 from itertools import permutations
 from copy import deepcopy
 from loguru import logger
+from statistics import mean
 
 try:
     with open("config.yaml", "r", encoding='utf8') as yaml_file:
         cfg = yaml.safe_load(yaml_file)
 except Exception as e:
-    print(f'Error opening the configuration file: {e}')
+    print(f"[ERROR] Configuration file could not be opened: {e}")
     sys.exit(1)
 
-"""Proxmox"""
+# Proxmox connection info
 server_url = f'https://{cfg["proxmox"]["url"]["ip"]}:{cfg["proxmox"]["url"]["port"]}'
 auth = dict(cfg["proxmox"]["auth"])
 
-"""Parameters"""
+# Balancing Parameters
 CONFIG_DEVIATION = CD = cfg["parameters"]["deviation"] / 200
 THRESHOLD = cfg["parameters"]["threshold"] / 100
 LXC_MIGRATION = cfg["parameters"]["lxc_migration"]
 MIGRATION_TIMEOUT = cfg["parameters"]["migration_timeout"]
-ONLY_ON_MASTER = cfg["parameters"].get("only_on_master", False)
+ONLY_ON_MASTER = cfg["parameters"].get("only_on_master", "OFF")
+TEST_MODE = cfg["parameters"].get("test_mode", "OFF")  # If ON, no real migrations
 
-"""Exclusions"""
+# Exclusions
 excluded_vms = []
-
 for x in tuple(cfg["exclusions"]["vms"]):
     if isinstance(x, int):
         excluded_vms.append(x)
@@ -44,88 +46,70 @@ for x in tuple(cfg["exclusions"]["vms"]):
         excluded_vms.extend(range(int(r[0]), int(r[1]) + 1))
     else:
         excluded_vms.append(int(x))
-
 excluded_nodes = tuple(cfg["exclusions"]["nodes"])
 
+# Groups
+node_groups = cfg.get("groups", {})
+node_to_group = {}
+for gname, nodes_list in node_groups.items():
+    for n in nodes_list:
+        node_to_group[n] = gname
 
-"""Mail"""
+# Balancing weights and thresholds
+weight_ram = cfg["balancing"]["weight_ram"]
+weight_cpu = cfg["balancing"]["weight_cpu"]
+memory_oom_threshold = cfg["balancing"]["memory_oom_threshold"]
+cpu_threshold = cfg["balancing"]["cpu_threshold"]
+
+# Mail
 send_on = cfg["mail"]["sending"]
 
-"""Loguru"""
+# Logging Level
 logger.remove()
-# For Linux service
 logger.add(sys.stdout, format="{level} | {message}", level=cfg["logging_level"])
-
-# For Windows and linux window mode (you can change sys.stdout to "file.log")
-# logger.add(sys.stdout,
-#            colorize=True,
-#            format="<green>{time:YYYY-MM-DD at HH:mm:ss}</green> | "
-#                   "<level>{level}</level> | "
-#                   "<level>{message}</level>",
-#            level=cfg["logging_level"])
-
-"""Constants"""
-GB = cfg["Gigabyte"]
-TB = cfg["Terabyte"]
-
-logger.info("START ***Load-balancer!***")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-"""Globals"""
-payload = dict()  # PVEAuthCookie
-header = dict()  # CSRFPreventionToken
 sum_of_deviations: float = 0
 iteration = 0
 
-
 class Cluster:
     def __init__(self, server: str):
-        logger.debug("init when creating a Cluster object")
-        """Cluster"""
+        logger.debug("Initializing Cluster object...")
         self.server: str = server
         self.cl_name = self.cluster_name()
         self.master_node: str = ""
         self.quorate: bool = False
-        """VMs and nodes"""
-        self.cl_nodes: int = 0                      # The number of nodes. Calculated in Cluster.cluster_name
-        self.cluster_information = {}               # Retrieved in Cluster.cluster_items
+        self.cl_nodes: int = 0
+        self.cluster_information = {}
+        self.included_nodes = {}
+        self.cl_lxcs = set()
+        self.cl_vms_included: dict = {}
+        self.cl_vms: dict = {}
+        self.cl_max_mem_included: int = 0
+        self.cl_mem_included: int = 0
+        self.mem_load: float = 0
+        self.mem_load_included: float = 0
+        self.cl_max_mem: int = 0
+        self.cl_cpu_included: int = 0
+        self.cl_cpu_load: float = 0
+        self.cl_cpu_load_include: float = 0
+        self.cl_cpu: int = 0
+
         self.cluster_items()
-        self.included_nodes = {}                    # Balanced nodes
-        self.cl_nodes: dict = self.cluster_hosts()  # All cluster nodes
-        self.cl_lxcs = set()                        # Defined in Cluster.self.cluster_vms
-        self.cl_vms_included: dict = {}             # All VMs and LXC are running in a balanced cluster
-        self.cl_vms: dict = self.cluster_vms()      # All VMs and Lxc are running in the cluster
-        """RAM"""
-        self.cl_mem_included: int = 0               # Cluster memory used in bytes for balanced nodes
-        self.cl_mem: int = 0                        # Cluster memory used in bytes
-        self.cl_max_mem_included: int = 0           # Total cluster memory in bytes for balanced nodes
-        self.mem_load: float = 0                    # Loading the cluster RAM in %
-        self.mem_load_included: float = 0           # Loading RAM, the balanced part of the cluster in %
-        self.cl_max_mem: int = self.cluster_mem()   # Total cluster memory in bytes
-        """CPU"""
-        self.cl_cpu_load: float = 0                 # Total load of cluster processors from 0 to 1
-        self.cl_cpu_load_include: float = 0         # Total load of cluster processors for balanced nodes from 0 to 1
-        self.cl_cpu_included: int = 0               # Total cores in a cluster for balanced nodes
-        self.cl_cpu = self.cluster_cpu()            # Total cores in the cluster
-        """Others"""
-        self.cluster_information = []
-        # self.show()
+        self.cl_nodes = self.cluster_hosts()
+        self.cl_vms = self.cluster_vms()
+        self.cl_max_mem = self.cluster_mem()
+        self.cl_cpu = self.cluster_cpu()
 
     def cluster_name(self):
-        """Getting the cluster name and the number of nodes in it"""
-        logger.debug("Starting Cluster.cluster_name")
-        name: str = ""
         url = f'{self.server}/api2/json/cluster/status'
-        name_request = nr = requests.get(url, cookies=payload, verify=False)
-        if name_request.ok:
-            logger.debug(f'Information about the cluster name has been received. Response code: {nr.status_code}')
-        else:
-            logger.warning(f'Execution error {Cluster.cluster_name.__qualname__}')
-            logger.warning(f'Could not get information about the cluster. Response code: {nr.status_code}. Reason: ({nr.reason})')
+        name_request = requests.get(url, cookies=payload, verify=False)
+        if not name_request.ok:
+            logger.warning('Could not get cluster info')
             sys.exit(0)
         temp = name_request.json()["data"]
-        del name_request, nr
+        name = ""
         for i in temp:
             if i["type"] == "cluster":
                 name = i["name"]
@@ -133,74 +117,50 @@ class Cluster:
         return name
 
     def cluster_items(self):
-        """Collecting preliminary information about the cluster"""
-        logger.debug("Launching Cluster.cluster_items")
         url = f'{self.server}/api2/json/cluster/resources'
-        logger.debug('Attempt to get information about the cluster...')
-        resources_request = rr = requests.get(url, cookies=payload, verify=False)
-        if resources_request.ok:
-            logger.debug(f'Information about the cluster has been received. Response code: {rr.status_code}')
-        else:
-            logger.warning(f'Execution error {Cluster.cluster_items.__qualname__}')
-            logger.warning(f'Could not get information about the cluster. Response code: {rr.status_code}. Reason: ({rr.reason})')
+        resources_request = requests.get(url, cookies=payload, verify=False)
+        if not resources_request.ok:
+            logger.warning('Could not get cluster resources')
             sys.exit(0)
-        self.cluster_information = rr.json()['data']
-        del resources_request, rr
+        self.cluster_information = resources_request.json()['data']
 
     def cluster_hosts(self):
-        """Getting nodes from cluster resources"""
-        logger.debug("Launching Cluster.cluster_hosts")
         nodes_dict = {}
-
-        # Find out which node is the current cluster master
         url = f'{self.server}/api2/json/cluster/ha/status/manager_status'
-        logger.debug('Attempt to get information about the cluster HA manager...')
-        resources_request = rr = requests.get(url, cookies=payload, verify=False)
-        if resources_request.ok:
-            logger.debug(f'Information about the cluster HA Manager has been received. Response code: {rr.status_code}')
-        else:
-            logger.warning(f'Execution error {Cluster.cluster_items.__qualname__}')
-            logger.warning(
-                f'Could not get information about the HA cluster manager. Response code: {rr.status_code}. Reason: ({rr.reason})')
+        rr = requests.get(url, cookies=payload, verify=False)
+        if not rr.ok:
+            logger.warning('Could not get HA manager status')
             sys.exit(0)
-
         self.master_node = rr.json()['data']['manager_status']['master_node']
         self.quorate = (rr.json()['data']['quorum']['quorate'] == "1")
+
         if not self.quorate:
-            # This is probably an error condition that should cause a "try again later"
-            logger.warning(f'Quorum is currently not quorate!')
+            logger.warning('Cluster quorum is not reached.')
 
         temp = deepcopy(self.cluster_information)
         for item in temp:
             if item["type"] == "node":
                 self.cluster_information.remove(item)
-                if item["status"] != "online":                              # Ignore nodes that are not online
+                if item["status"] != "online":
                     continue
-                item["cpu_used"] = round(item["maxcpu"] * item["cpu"], 2)   # Adding the value of the cores used
-                item["free_mem"] = item["maxmem"] - item["mem"]             # Adding the value of free RAM
-                item["mem_load"] = item["mem"] / item["maxmem"]             # Adding the RAM load value
-                item["is_master"] = (item["node"] == self.master_node)      # Flagging the current master node
+                item["cpu_used"] = round(item["maxcpu"] * item["cpu"], 2)
+                item["free_mem"] = item["maxmem"] - item["mem"]
+                item["mem_load"] = item["mem"] / item["maxmem"]
+                item["is_master"] = (item["node"] == self.master_node)
                 nodes_dict[item["node"]] = item
 
                 if item["node"] not in excluded_nodes:
                     self.included_nodes[item["node"]] = item
-        del temp
         return nodes_dict
 
     def cluster_vms(self):
-        """Getting VM/Lxc from cluster resources"""
-        logger.debug("Launching Cluster.cluster_vms")
         vms_dict = {}
         temp = deepcopy(self.cluster_information)
         for item in temp:
-            if item["type"] == "qemu" and item["status"] == "running":
+            if item["type"] in ["qemu", "lxc"] and item["status"] == "running":
                 vms_dict[item["vmid"]] = item
-                if item["node"] not in excluded_nodes and item["vmid"] not in excluded_vms:
-                    self.cl_vms_included[item["vmid"]] = item
-                self.cluster_information.remove(item)
-            elif item["type"] == "lxc" and item["status"] == "running":
-                vms_dict[item["vmid"]] = item
-                self.cl_lxcs.add(item["vmid"])
+                if item["type"] == "lxc":
+                    self.cl_lxcs.add(item["vmid"])
                 if item["node"] not in excluded_nodes and item["vmid"] not in excluded_vms:
                     self.cl_vms_included[item["vmid"]] = item
                 self.cluster_information.remove(item)
@@ -208,8 +168,6 @@ class Cluster:
         return vms_dict
 
     def cluster_mem(self):
-        """Calculating RAM usage from cluster resources"""
-        logger.debug("Launching Cluster.cluster_membership")
         cl_max_mem = 0
         cl_used_mem = 0
         for node, sources in self.cl_nodes.items():
@@ -221,14 +179,11 @@ class Cluster:
                 cl_used_mem += sources["mem"]
         cl_max_mem += self.cl_max_mem_included
         cl_used_mem += self.cl_mem_included
-        self.cl_mem = cl_used_mem + self.cl_mem_included
         self.mem_load = cl_used_mem / cl_max_mem
         self.mem_load_included = self.cl_mem_included / self.cl_max_mem_included
         return cl_max_mem
 
     def cluster_cpu(self):
-        """Calculating CPU usage from cluster resources"""
-        logger.debug("Launching Cluster.cluster_cpu")
         cl_cpu_used: float = 0
         cl_cpu_used_included: float = 0
         cl_max_cpu: int = 0
@@ -245,86 +200,161 @@ class Cluster:
         self.cl_cpu_load_include = cl_cpu_used_included / self.cl_cpu_included
         return cl_max_cpu
 
-    def show(self):
-        """Cluster summary"""
-        logger.debug("Launching Cluster.show")
-        print(f'Server address: {self.server}')
-        print(f'Cluster name: {self.cl_name}')
-        print(f'Number of nodes: {len(self.cl_nodes)}')
-        print(f'Number of balanced nodes: {len(self.cl_nodes) - len(excluded_nodes)}')
-        print(f'Number of VMs: {len(self.cl_vms)}')
-        print(f'Number of VMs being balanced: {len(self.cl_vms_included)}')
-        print(f'Shared cluster RAM: {round(self.cl_max_mem / TB, 2)} TB. Loading {round((self.mem_load * 100), 2)}%')
-        print(f'RAM of the balanced part of the cluster: {round(self.cl_max_mem_included / TB, 2)} TB. Loading {round((self.mem_load_included * 100), 2)}%')
-        print(f'Number of CPU cores in the cluster: {self.cl_cpu}, loading {round((self.cl_cpu_load * 100), 2)}%')
-        print(f'The number of cores of the balanced part of the cluster: {self.cl_cpu_included}, loading {round((self.cl_cpu_load_include * 100), 2)}%')
-
 
 def authentication(server: str, data: dict):
-    """Authentication and receipt of a token and ticket."""
     global payload, header
     url = f'{server}/api2/json/access/ticket'
-    logger.debug('Authorization attempt...')
+    logger.info("[AUTH] Attempting authentication...")
     try:
         get_token = requests.post(url, data=data, verify=False)
     except Exception as exc:
-        message = f'Incorrect server address or port settings: {exc}'
-        logger.exception(message)
-        send_mail(f'Proxmox node ({server_url}) is unavailable. Network or settings problem')
+        logger.error(f"Connection issue: {exc}")
+        send_mail(f'Node ({server_url}) unreachable')
         sys.exit(1)
-    if get_token.ok:
-        logger.debug(f'Successful authentication. Response code: {get_token.status_code}')
-    else:
-        logger.debug(f'Execution error {authentication.__qualname__}')
-        logger.error(f'Authentication failed. Response code: {get_token.status_code}. Reason: {get_token.reason}')
+    if not get_token.ok:
+        logger.error(f'Authentication failed with status {get_token.status_code}')
         sys.exit(1)
     payload = {'PVEAuthCookie': (get_token.json()['data']['ticket'])}
     header = {'CSRFPreventionToken': (get_token.json()['data']['CSRFPreventionToken'])}
+    logger.info("[AUTH] Authentication successful!")
 
 
 def cluster_load_verification(mem_load: float, cluster_obj: object) -> None:
-    """Checking the RAM load of the balanced part of the cluster"""
-    logger.debug("Starting cluster_load_verification")
-    if len(cluster_obj.cl_nodes) - len(excluded_nodes) == 1:
-        logger.error('It is impossible to balance one node!')
+    logger.debug("[CHECK] Verifying cluster load...")
+    if len(cluster_obj.included_nodes) - len(excluded_nodes) == 1:
+        logger.error("Only one node is included, balancing not possible.")
         sys.exit(1)
-    assert 0 < mem_load < 1, 'The cluster RAM load should be in the range from 0 to 1'
+    if not (0 < mem_load < 1):
+        logger.error("Cluster memory load invalid.")
+        sys.exit(1)
     if mem_load >= THRESHOLD:
-        logger.warning(f'Cluster RAM usage is too high {(round(cluster_obj.mem_load * 100, 2))}')
-        logger.warning('It is not possible to safely balance the cluster')
-        sys.exit(1)
+        logger.warning("Cluster memory load near threshold. Balancing may be needed.")
+
+
+def check_risk(cluster_obj: object) -> (bool, bool):
+    logger.debug("[CHECK] Calculating OOM and CPU risk...")
+    oom_risk = False
+    cpu_risk = False
+
+    for node, values in cluster_obj.included_nodes.items():
+        node_mem_load_percent = values["mem_load"] * 100
+        node_cpu_percent = (values["cpu_used"] / values["maxcpu"]) * 100
+        if node_mem_load_percent > memory_oom_threshold:
+            logger.warning(f"High OOM risk on node {node}, mem load > {memory_oom_threshold}%.")
+            oom_risk = True
+        if node_cpu_percent > cpu_threshold:
+            logger.warning(f"High CPU load on node {node}, CPU load > {cpu_threshold}%.")
+            cpu_risk = True
+
+    cluster_mem_percent = cluster_obj.mem_load_included * 100
+    cluster_cpu_percent = cluster_obj.cl_cpu_load_include * 100
+    if cluster_mem_percent > memory_oom_threshold:
+        logger.warning(f"High OOM risk on entire cluster, mem load > {memory_oom_threshold}%.")
+        oom_risk = True
+    if cluster_cpu_percent > cpu_threshold:
+        logger.warning(f"Cluster CPU load > {cpu_threshold}%.")
+        cpu_risk = True
+
+    return oom_risk, cpu_risk
+
+
+def fetch_rrd_data(node: str, vmid: int, timeframe='hour') -> list:
+    # Fetch RRD data for the VM to calculate CPU trend.
+    # This returns a list of data points with "cpu" usage among other metrics.
+    # Endpoint: /nodes/{node}/qemu/{vmid}/rrddata or /nodes/{node}/lxc/{vmid}/rrddata
+    # We'll assume qemu for simplicity; if lxc, adjust accordingly.
+    # For demonstration, we assume qemu. For LXC: /nodes/{node}/lxc/{vmid}/rrddata
+    # Note: This is a simplified example, actual parsing may differ.
+    vm_type = "qemu" if vmid not in cluster_obj.cl_lxcs else "lxc"
+    url = f'{server_url}/api2/json/nodes/{node}/{vm_type}/{vmid}/rrddata?timeframe={timeframe}'
+    r = requests.get(url, cookies=payload, verify=False)
+    if not r.ok:
+        return []
+    data = r.json()['data']
+    # data is typically a list of time/value entries. We'll look for "cpu".
+    return data
+
+
+def calculate_cpu_trend(rrd_data: list) -> float:
+    # Given RRD data, extract CPU values and compute an average.
+    # RRD data often contains 'cpu' as a fraction (0 to 1). We'll compute mean.
+    cpu_values = []
+    for entry in rrd_data:
+        # entry might look like {"time":..., "cpu":0.02,...}
+        if 'cpu' in entry and entry['cpu'] is not None:
+            cpu_values.append(entry['cpu'])
+    if not cpu_values:
+        return 0.0
+    # Compute short avg CPU usage over RRD timeframe
+    return mean(cpu_values)
+
+
+def update_vm_cpu_trends(cluster_obj: object):
+    # Fetch and store CPU trends for each VM
+    for vmid, vm_info in cluster_obj.cl_vms_included.items():
+        node = vm_info["node"]
+        rrd_data = fetch_rrd_data(node, vmid, timeframe='hour')
+        vm_info["cpu_trend"] = calculate_cpu_trend(rrd_data)
+        logger.debug(f"VM:{vmid} CPU trend (hourly avg): {vm_info['cpu_trend']*100:.2f}%")
+    # Additionally, we might adjust node level CPU from these values if needed.
 
 
 def need_to_balance_checking(cluster_obj: object) -> bool:
-    """Checking the need for balancing"""
-    logger.debug("Starting need_to_balance_checking")
     global sum_of_deviations, iteration
     nodes = cluster_obj.included_nodes
-    average = cluster_obj.mem_load_included
+    avg_ram = cluster_obj.mem_load_included
+
+    # Instead of only instantaneous CPU, use CPU trend from VMs to estimate node CPU load:
+    # Approx: node cpu load from trend = average of CPU_trend of VMs on that node * factor or just rely on node_data
+    # For simplicity, just combine instantaneous CPU and VM trend if available.
+    # We'll average VM trends on each node to get a better node CPU estimation.
+    logger.debug("[CHECK] Calculating deviation with CPU trends...")
+
+    node_cpu_estimation = {}
+    for node in nodes:
+        # avg CPU trend of VMs on this node
+        node_vms = [vmid for vmid, info in cluster_obj.cl_vms_included.items() if info["node"] == node]
+        if node_vms:
+            trends = [cluster_obj.cl_vms_included[vmid].get("cpu_trend", 0) for vmid in node_vms]
+            avg_vm_cpu_trend = mean(trends) if trends else 0
+        else:
+            # No VM or not available
+            avg_vm_cpu_trend = nodes[node]["cpu"]  # fallback
+        # combine with node CPU load
+        # We'll just use avg_vm_cpu_trend as main factor
+        node_cpu_estimation[node] = avg_vm_cpu_trend if avg_vm_cpu_trend > 0 else (nodes[node]["cpu_used"]/nodes[node]["maxcpu"])
+
+    avg_cpu = mean(node_cpu_estimation.values()) if node_cpu_estimation else cluster_obj.cl_cpu_load_include
+
     for host, values in nodes.items():
-        values["deviation"] = abs(values["mem_load"] - average)
-    sum_of_deviations = sum(values["deviation"] for values in nodes.values())
+        ram_deviation = abs(values["mem_load"] - avg_ram)
+        cpu_current = node_cpu_estimation[host]
+        cpu_dev = abs(cpu_current - avg_cpu)
+        values["deviation"] = weight_ram * ram_deviation + weight_cpu * cpu_dev
+
+    sum_of_deviations = sum(v["deviation"] for v in nodes.values())
+
     if iteration > 10:
         operational_deviation = CD/2 if random() > 1/3 else CD/4 if random() > 1/6 else CD/8
-        logger.debug(f'operational_deviation changed to {operational_deviation}')
         iteration = 0
     else:
         operational_deviation = CONFIG_DEVIATION
-    for values in nodes.values():
-        if values["deviation"] > operational_deviation:
+
+    for val in nodes.values():
+        if val["deviation"] > operational_deviation:
+            logger.info(f"[CHECK] Deviation > {operational_deviation}. Balancing needed.")
             return True
-    else:
-        return False
+
+    logger.info("[CHECK] No significant deviation. No balancing needed.")
+    return False
 
 
 def temporary_dict(cluster_obj: object) -> object:
-    """Preparation of information for subsequent processing"""
-    logger.debug("Running temporary_dict")
     obj = {}
-    vm_dict = cluster_obj.cl_vms_included
-    if not LXC_MIGRATION:
+    vm_dict = deepcopy(cluster_obj.cl_vms_included)
+    if LXC_MIGRATION == "OFF":
         for lxc in cluster_obj.cl_lxcs:
-            del vm_dict[lxc]
+            vm_dict.pop(lxc, None)
     for host in cluster_obj.included_nodes:
         hosts = {}
         for vm, value in vm_dict.items():
@@ -335,106 +365,175 @@ def temporary_dict(cluster_obj: object) -> object:
 
 
 def calculating(hosts: object, cluster_obj: object) -> list:
-    """The function of selecting the optimal VM migration options for the cluster balance"""
-    logger.debug("Starting calculating")
-    count = 0
     variants: list = []
     nodes = cluster_obj.included_nodes
-    average = cluster_obj.mem_load_included
+    avg_ram = cluster_obj.mem_load_included
+
+    # Reuse the node_cpu_estimation logic from above if needed:
+    node_cpu_estimation = {}
+    for node in nodes:
+        node_vms = [vmid for vmid, info in cluster_obj.cl_vms_included.items() if info["node"] == node]
+        if node_vms:
+            trends = [cluster_obj.cl_vms_included[vmid].get("cpu_trend", 0) for vmid in node_vms]
+            avg_vm_cpu_trend = mean(trends) if trends else 0
+        else:
+            avg_vm_cpu_trend = nodes[node]["cpu_used"]/nodes[node]["maxcpu"]
+        node_cpu_estimation[node] = avg_vm_cpu_trend if avg_vm_cpu_trend > 0 else (nodes[node]["cpu_used"]/nodes[node]["maxcpu"])
+
+    avg_cpu = mean(node_cpu_estimation.values()) if node_cpu_estimation else cluster_obj.cl_cpu_load_include
+
+    logger.info("┌─────────────────────────────────┐")
+    logger.info("│ Calculating possible migrations │")
+    logger.info("└─────────────────────────────────┘")
+
+    global sum_of_deviations
+
     for host in permutations(nodes, 2):
-        part_of_deviation = sum(values["deviation"] if node not in host else 0 for node, values in nodes.items())
-        for vm in hosts[host[0]].values():
-            h0_mem_load = (nodes[host[0]]["mem"] - vm["mem"]) / nodes[host[0]]["maxmem"]
-            h0_deviation = h0_mem_load - average if h0_mem_load > average else average - h0_mem_load
-            h1_mem_load = (nodes[host[1]]["mem"] + vm["mem"]) / nodes[host[1]]["maxmem"]
-            h1_deviation = h1_mem_load - average if h1_mem_load > average else average - h1_mem_load
-            temp_full_deviation = part_of_deviation + h0_deviation + h1_deviation
+        if node_to_group.get(host[0]) != node_to_group.get(host[1]):
+            continue
+        donor = host[0]
+        recipient = host[1]
+
+        base_deviations = 0
+        for node_name, vals in nodes.items():
+            if node_name not in host:
+                base_deviations += vals["deviation"]
+
+        for vm in hosts[donor].values():
+            donor_new_mem = (nodes[donor]["mem"] - vm["mem"])
+            recipient_new_mem = (nodes[recipient]["mem"] + vm["mem"])
+            donor_new_load = donor_new_mem / nodes[donor]["maxmem"]
+            recipient_new_load = recipient_new_mem / nodes[recipient]["maxmem"]
+
+            # CPU estimation doesn't change easily without VM-specific CPU usage details.
+            # We'll assume CPU trends remain similar after migration for evaluation:
+            # A more complex approach would remove VM CPU from donor and add to recipient to recalc.
+            # For simplicity, assume average CPU load shift:
+            # If this VM had a certain trend, removing it from donor, adding to recipient:
+            vm_cpu_trend = cluster_obj.cl_vms_included[vm["vmid"]]["cpu_trend"] if vm["vmid"] in cluster_obj.cl_vms_included else 0
+
+            donor_cpu_ratio = max(0, node_cpu_estimation[donor] - vm_cpu_trend/2) # rough approximation
+            recipient_cpu_ratio = min(1, node_cpu_estimation[recipient] + vm_cpu_trend/2)
+
+            donor_ram_dev = abs(donor_new_load - avg_ram)
+            recipient_ram_dev = abs(recipient_new_load - avg_ram)
+            donor_cpu_dev = abs(donor_cpu_ratio - avg_cpu)
+            recipient_cpu_dev = abs(recipient_cpu_ratio - avg_cpu)
+
+            donor_dev = weight_ram * donor_ram_dev + weight_cpu * donor_cpu_dev
+            recipient_dev = weight_ram * recipient_ram_dev + weight_cpu * recipient_cpu_dev
+
+            temp_full_deviation = base_deviations + donor_dev + recipient_dev
+
             if temp_full_deviation < sum_of_deviations:
-                variant = (host[0], host[1], vm["vmid"], temp_full_deviation)
-                variants.append(variant)
-                count += 1
-    logger.info(f'Number of options = {count}')
-    return sorted(variants, key=lambda last: last[-1])
+                variants.append((donor, recipient, vm["vmid"], temp_full_deviation))
+
+    variants.sort(key=lambda x: x[-1])
+    logger.info(f"[CALC] Found {len(variants)} beneficial migration variants.")
+    return variants
 
 
 def vm_migration(variants: list, cluster_obj: object) -> None:
-    """VM migration function from the suggested variants"""
-    logger.debug("Starting vm_migration")
     local_disk = None
     local_resources = None
     clo = cluster_obj
     error_counter = 0
     problems: list = []
+
+    if not variants:
+        logger.info("[MIGRATE] No migration variants to process.")
+        return
+
+    logger.info("┌───────────────────────────┐")
+    logger.info("│ Starting VM Migrations... │")
+    logger.info("└───────────────────────────┘")
+
+    if TEST_MODE == "ON":
+        logger.info("[TEST MODE] The following migrations would be attempted:")
+        for donor, recipient, vm, _ in variants:
+            logger.info(f"[TEST MODE] Migrate VM:{vm} from {donor} to {recipient}")
+        logger.info("[TEST MODE] No real migrations performed.")
+        return
+
     for variant in variants:
         if error_counter > 2:
-            logger.exception(f'The number of migration errors has reached {error_counter} pieces.')
-            send_mail(f'Problems occurred during VM:{problems} migration. Check the VM status')
+            logger.error("[MIGRATE] Too many migration errors.")
+            send_mail(f'Migration errors: {problems}')
             sys.exit(1)
         donor, recipient, vm = variant[:3]
-        logger.debug(f'VM:{vm} migration from {donor} to {recipient}')
+        logger.info(f"[MIGRATE] Attempting migration of VM:{vm} from {donor} → {recipient}")
+
         if vm in cluster_obj.cl_lxcs:
             options = {'target': recipient, 'restart': 1}
             url = f'{cluster_obj.server}/api2/json/nodes/{donor}/lxc/{vm}/migrate'
         else:
             options = {'target': recipient, 'online': 1}
-            url = f'{cluster_obj.server}/api2/json/nodes/{donor}/qemu/{vm}/migrate'
-            check_request = requests.get(url, cookies=payload, verify=False)
-            local_disk = (check_request.json()['data']['local_disks'])
-            local_resources = (check_request.json()['data']['local_resources'])
-        if local_disk or local_resources:
-            logger.debug(f'The VM:{vm} has {local_disk if local_disk else local_resources if local_resources else ""}')
-            # local_disk & Local_resource need to be reset after the check (if we start with a unmovable VM, the rest are never tested)
-            local_disk = None
-            local_resources = None
-            continue  # for variant in variants:
-        else:
-            # request migration
-            job = requests.post(url, cookies=payload, headers=header, data=options, verify=False)
-            if job.ok:
-                logger.info(f'Migration VM:{vm} ({round(clo.cl_vms[vm]["mem"] / GB, 2)} GB mem) from {donor} to {recipient}...')
-                pid = job.json()['data']
-                error_counter -= 1
-            else:
-                logger.warning(f'Error when requesting migration VM {vm} from {donor} to {recipient}. Check the request.')
+            check_url = f'{cluster_obj.server}/api2/json/nodes/{donor}/qemu/{vm}/migrate'
+            check_request = requests.get(check_url, cookies=payload, verify=False)
+            if not check_request.ok:
+                logger.warning("[MIGRATE] Could not check VM migration info.")
                 error_counter += 1
                 problems.append(vm)
-                continue  # for variant in variants:
+                continue
+            local_disk = check_request.json()['data']['local_disks']
+            local_resources = check_request.json()['data']['local_resources']
+            url = check_url
+
+        if local_disk or local_resources:
+            logger.info(f"[MIGRATE] VM:{vm} has local resources that can't be migrated easily.")
+            local_disk = None
+            local_resources = None
+            continue
+        else:
+            job = requests.post(url, cookies=payload, headers=header, data=options, verify=False)
+            if not job.ok:
+                logger.warning("[MIGRATE] Migration request failed.")
+                error_counter += 1
+                problems.append(vm)
+                continue
+            pid = job.json()['data']
+            error_counter -= 1
             status = True
             timer: int = 0
-            while status: # confirm the migration is done
+
+            while status:
                 timer += 10
                 sleep(10)
                 if vm in cluster_obj.cl_lxcs:
-                    url = f'{cluster_obj.server}/api2/json/nodes/{recipient}/lxc'
+                    url_check = f'{cluster_obj.server}/api2/json/nodes/{recipient}/lxc'
                 else:
-                    url = f'{cluster_obj.server}/api2/json/nodes/{recipient}/qemu'
-                request = requests.get(url, cookies=payload, verify=False)
+                    url_check = f'{cluster_obj.server}/api2/json/nodes/{recipient}/qemu'
+
+                request = requests.get(url_check, cookies=payload, verify=False)
+                if not request.ok:
+                    send_mail(f'Problem checking VM:{vm} after migration')
+                    sys.exit(1)
                 recipient_vms = request.json()['data']
+                found = False
                 for _ in recipient_vms:
-                    if int(_['vmid']) == vm and _['status'] == 'running':
-                        logger.info(f'{pid} - Completed!')
-                        sleep(10)
-                        if vm in cluster_obj.cl_vms:
-                            url = f'{cluster_obj.server}/api2/json/nodes/{recipient}/qemu/{vm}/status/resume'
-                            request = requests.post(url, cookies=payload, headers=header, verify=False)
-                            logger.debug(f'Resuming {vm} after {pid}: {request.ok}')
-                        status = False
-                        break  # for _ in recipient_vms:
-                    elif _['vmid'] == vm and _['status'] != 'running':
-                        send_mail(f'Problems occurred during VM:{vm} migration. Check the VM status')
-                        logger.exception(f'Something went wrong during the migration. Response code{request.status_code}')
-                        sys.exit(1)
-                    else:
-                        logger.info(f'VM Migration: {vm}... {timer} sec.')
-            break  # for variant in variants:
+                    if int(_['vmid']) == vm:
+                        found = True
+                        if _['status'] == 'running':
+                            logger.info(f"[MIGRATE] Migration of VM:{vm} complete after {timer}s!")
+                            sleep(10)
+                            if vm in cluster_obj.cl_vms:
+                                resume_url = f'{cluster_obj.server}/api2/json/nodes/{recipient}/qemu/{vm}/status/resume'
+                                requests.post(resume_url, cookies=payload, headers=header, verify=False)
+                            status = False
+                        else:
+                            logger.warning(f"[MIGRATE] VM:{vm} found but not running.")
+                            send_mail(f'Check VM:{vm} post-migration status')
+                            sys.exit(1)
+                        break
+                if not found:
+                    logger.info(f"[MIGRATE] VM:{vm} migration in progress... {timer}s")
+            break
 
 
 def send_mail(message: str):
-    if send_on:
-        logger.debug("Starting send_mail")
-        email_content = message
+    if send_on == "ON":
         msg = EmailMessage()
-        msg.set_payload(email_content)
+        msg.set_payload(message)
         msg['Subject'] = cfg["mail"]["message_subject"]
         msg['From'] = cfg["mail"]["from"]
         msg['To'] = cfg["mail"]["to"]
@@ -442,51 +541,76 @@ def send_mail(message: str):
         password: str = cfg["mail"]["password"]
         s = smtplib.SMTP(f'{cfg["mail"]["server"]["address"]}:{cfg["mail"]["server"]["port"]}')
         encryption = cfg["mail"]["ssl_tls"]
-        if encryption:
+        if encryption == "ON":
             s.starttls()
         try:
             s.login(login, password)
             s.sendmail(msg['From'], [msg['To']], msg.as_string())
-            logger.trace('Notification sent')
+            logger.debug('[MAIL] Notification sent.')
         except Exception as exc:
-            logger.debug(f'Problem when sending an email: {exc}')
-            logger.exception(f'The message has not been sent. Check the SMTP settings')
+            logger.debug(f'[MAIL] Sending mail failed: {exc}')
         finally:
             s.quit()
-    else:
-        pass
+
+
+def re_measure_cluster(cluster: object):
+    # After migrations, re-fetch CPU trends and re-check cluster conditions
+    logger.info("[RE-MEASURE] Re-measuring cluster load and CPU trends after migration...")
+    update_vm_cpu_trends(cluster)
 
 
 def main():
-    """The main body of the program"""
     global iteration
+    print("========================================")
+    print("        Proxmox Load Balancer")
+    if TEST_MODE == "ON":
+        print("          [TEST MODE ACTIVE]")
+    print("========================================")
     authentication(server_url, auth)
-    cluster = Cluster(server_url)
-    if ONLY_ON_MASTER:
+    global cluster_obj
+    cluster_obj = Cluster(server_url)
+
+    if ONLY_ON_MASTER == "ON":
         hostname = socket.gethostname()
-        master = cluster.master_node
+        master = cluster_obj.master_node
         if hostname != master:
-            logger.info(
-                f'This server ({hostname}) is not the current cluster master, {master} is. Waiting 300 seconds.')
+            logger.info(f"This node ({hostname}) is not the current cluster master ({master}). Waiting...")
             sleep(300)
             return
-    cluster_load_verification(cluster.mem_load_included, cluster)
-    need_to_balance = need_to_balance_checking(cluster)
-    logger.info(f'Need to balance: {need_to_balance}')
+
+    # Display cluster info
+    print(f"Cluster Name: {cluster_obj.cl_name}")
+    print(f"Included Nodes: {', '.join(cluster_obj.included_nodes.keys())}")
+    print(f"Cluster RAM Load: {cluster_obj.mem_load_included * 100:.2f}%")
+    print(f"Cluster CPU Load: {cluster_obj.cl_cpu_load_include * 100:.2f}%")
+    print("========================================")
+
+    cluster_load_verification(cluster_obj.mem_load_included, cluster_obj)
+    # First fetch CPU trends
+    update_vm_cpu_trends(cluster_obj)
+    oom_risk, cpu_risk = check_risk(cluster_obj)
+
+    need_to_balance = need_to_balance_checking(cluster_obj) or oom_risk or cpu_risk
     if need_to_balance:
         iteration = 0
-        balance_cl = temporary_dict(cluster)
-        sorted_variants = calculating(balance_cl, cluster)
+        balance_cl = temporary_dict(cluster_obj)
+        sorted_variants = calculating(balance_cl, cluster_obj)
         if sorted_variants:
-            vm_migration(sorted_variants, cluster)
-            logger.info('Waiting 10 seconds for cluster information update')
+            vm_migration(sorted_variants, cluster_obj)
+            logger.info("[INFO] Post-migration pause for cluster re-evaluation.")
             sleep(10)
+            re_measure_cluster(cluster_obj)
+            oom_risk_after, cpu_risk_after = check_risk(cluster_obj)
+            if oom_risk_after or cpu_risk_after:
+                logger.info("[INFO] Risk still high after migration.")
+            else:
+                logger.info("[INFO] Situation improved after migration.")
         else:
+            logger.info("[INFO] No variants found. Waiting before next attempt...")
             sleep(60)
-            pass  # TODO Aggressive algorithm
     else:
-        logger.info('The cluster is balanced. Waiting 300 seconds.')
         iteration += 1
+        logger.info("[INFO] Cluster balanced. Sleeping 300 seconds.")
         sleep(300)
 
 

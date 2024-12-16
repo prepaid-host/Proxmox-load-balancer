@@ -1,42 +1,39 @@
-## Proxmox-load-balancer Pro v0.6.4  
+## Proxmox-load-balancer v1
 
-## Unfortunately, I no longer have time to support the project and answer questions. I am ready to transfer all rights to it to anyone who wants to support and develop it. I will post a link to your repository. There are many interesting ideas in the pool request. If you are interested, write to me. I hope he helped a lot and made admin life easier =)
+This script is designed to automatically balance both RAM and CPU load across the nodes of a Proxmox cluster. It introduces additional enhancements such as CPU trend analysis, configurable thresholds, test mode for safe simulation, and improved handling of VM migrations within predefined node groups. The script constantly monitors your cluster and attempts to redistribute VMs to maintain a defined deviation range, ensuring that no single node becomes a bottleneck.
 
-## Please take a look: https://github.com/cvk98/Proxmox-load-balancer/issues/7
+### Key Features:
+1. **RAM and CPU Balancing**:  
+   Balances the cluster based on both RAM and CPU load. CPU trend data (via RRD) and momentary values are considered, ensuring a more holistic resource distribution.
 
-If you use this script and it works correctly - please do not be lazy to put a star. This motivates me very much to develop my product. If you lack some functions, write about it. I will try to add them if they fit into the product concept.
-	
-<strong>Development progress:</strong>
-1. <strike>Write a draft script</strike>
-2. <strike>Put "break" and "continue" in their places</strike>
-3. <strike>Arrange the functions in their places</strike>
-4. <strike>Ca</strike>tch bugs
-5. <strike>Correct variable names</strike>
-6. <strike>Add comments</strike>
-7. <strike>Add logging and sending notifications to the mail</strike>
-8. <strike>Urgently translate into English</strike>
-9. Add a VM selection algorithm for special cases when there is a need for migration, but there is no option that improves the balance	
-10. <strike>Test on th</strike>ree clusters
+2. **Configurable Parameters**:  
+   Set thresholds for CPU and RAM (e.g. OOM risk percentage, CPU usage percentage) as well as a deviation range for balancing operations in `config.yaml`.
 
-![Excluded px-3](https://user-images.githubusercontent.com/88323643/164393540-9be1f695-59ba-4e96-a629-a9e9fd310795.jpg)
+3. **Exclusions & Groups**:  
+   Define which VMs and nodes should be excluded. Group nodes together so that VMs only migrate within the same group.
 
-This script is designed to automatically load balance the RAM of the cluster (or part of the cluster) Proxmox.
-It does not use the CPU load balancing mechanism. I consider this unnecessary for many reasons, which it is inappropriate to list here.
-Unlike https://github.com/cvk98/Proxmox-memory-balancer the algorithm of this script has been significantly changed. 
+4. **LXC Migration Toggle**:  
+   Optionally disable LXC migrations if necessary.
 
-In particular:
-1. Added a list of exclusions for the VMs and nodes.
-2. It is now possible to disable LXC migration.
-3. You can set the spread range of node loading, at which there is no balancing.
-4. The VM selection algorithm for migration has been significantly redesigned (other criteria for evaluating the proposed migration options).
-5. This script works constantly and does not finish its work when the balance is reached. Just falls asleep for 5 minutes (can be changed).  
-6. Now the script can be deployed automatically (via ansible) to all nodes of the cluster using HA. To do this, set only_on_master: ON in the config. Then it will run only on the master node.
+5. **Continuous Operation**:  
+   The script runs constantly, sleeping between attempts. If balance is achieved, it waits before re-checking. If thresholds are exceeded, it tries to restore balance more aggressively.
 
-Most likely, the script does not need a root PVE account. You can create a separate account with the necessary rights (not tested). But for those who are worried that the script may harm your cluster, I can say that there is only one POST method used for VM/LXC migration.
+6. **Test Mode**:  
+   Run the script in test mode to simulate migrations without applying them, useful for verifying configuration and logic before going live.
 
-### Does not take into account the recommendations of HA!
+7. **Integration with HA**:  
+   Deploy automatically (e.g. via Ansible) to all nodes. Activate `only_on_master` in the config to ensure it only runs on the current HA master node.
 
-### Recommendations:
+### Requirements & Recommendations:
+- **Shared Storage**:  
+  A shared or distributed storage (e.g. CEPH) accessible to all nodes is required for online migrations.
+
+- **Deviation Setting**:  
+  A recommended minimum deviation is 1% for large clusters and around 3-5% for medium/small clusters. A value of 0% leads to constant migrations.
+
+- **Proxmox Access**:  
+  Ensure continuous access to the Proxmox host. The script can be run directly on a Proxmox node or within a VM/LXC in the cluster. Use systemd to set it as a service.
+
 1. **For the migration mechanism to work correctly, a shared storage is required. This can be a CEPH (or other distributed storage) or a storage system connected to all Proxmox nodes.**
 2. For a cluster similar in size and composition to the one in the screenshot, the normal value of "deviation" is 4%. This means that with an average load of the cluster (or part of it) the maximum deviation of the RAM load of each node can be 2% in a larger or smaller direction.
 Example: cluster load is 50%, the minimum loaded node is 48%, the maximum loaded node is 52%.
@@ -69,61 +66,10 @@ Moreover, it does not matter at all how much RAM the node has.
 ```systemctl status load-balancer.service```  
 ```systemctl enable load-balancer.service```  
 
-<i>Tested on Proxmox 7.1-10 virtual environment with more than 400 virtual machines</i>  
+<i>Tested on Proxmox 8.2-2 virtual environment with more than 1500 virtual machines</i>  
 **Before using the script, please read the Supplement to the license**
 
-# Changelog:
 
-### 0.6.4 (21.03.23)  
-1. fix of an error that occurs when nodes are turned off (thanks to dmitry-ko) 
-https://github.com/cvk98/Proxmox-load-balancer/pull/14
-
-
-### 0.6.3 (07.11.22)  
-1. fix bug with lxc migration (thanks to MarcMocker) 
-https://github.com/cvk98/Proxmox-load-balancer/pull/11
-
-### 0.6.2 (22.08.22)  
-1. Add range generation for vm exclusion (thanks to Azerothian)
-https://github.com/cvk98/Proxmox-load-balancer/pull/9
-
-### 0.6.1 (22.06.22)
-1. Added the "resume" operation 10 seconds after VM migration. Since sometimes the following situation occurs:
-  
-  ![image](https://user-images.githubusercontent.com/88323643/175003454-eb7014c7-b6be-401b-9420-956487be0034.png)  
-
-### 0.6.0 (23.05.22)
-1. Added a mechanism for checking the launch of the load balancer on the HA cluster master node (thanks to Cylindrical)
-https://github.com/cvk98/Proxmox-load-balancer/pull/3
-	
-### 0.5.2 (20.05.22)  
-1. Minor improvements suggested by Cylindric regarding cluster health check
-
-### 0.5.1 (18.05.22)  
-1. If the cluster has been balanced for the last 10 attempts, the "operational_deviation" parameter is reduced by 2 or 4 or 8 times with some probability.  
-	
-### 0.5.0 (04.05.22)  
-1. Added email notification about critical events  	
-	
-### 0.4.2 (29.04.22)  
-1. Removed bestconfig due to encoding issues  
-2. Added a check when opening the config	
-	
-### 0.4.0 (28.04.22)  
-1. All settings are placed in the configuration file (config.yaml)
-	
-### 0.3.0 (22.04.2022)
-1. Added logging based on the loguru library (don't forget `pip3 install loguru`). Now logs can be viewed in the console or /var/log/syslog  
-2. sys.exit() modes have been changed for the script to work correctly in daemon mode
-
-### 0.2.0 (20.04.2022)
-1. All comments and messages are translated into English
-2. UTF-8 encoding throughout the document
-
-##### Running the script is tested on:
-1. PyCharm 2021+, Python 3.10+, Win10
-2. Proxmox LXC Ubuntu 20.04 (1 core, 256 MB, 5GB HDD), Python 3.8+ <strike>(0.4.0)</strike>
-
-**If you have any exceptions, please write about them in https://github.com/cvk98/Proxmox-load-balancer/issues. I'll try to help you.**
+**If you have any exceptions, please write about them in https://github.com/prepaid-host/Proxmox-load-balancer/issues. I'll try to help you.**
 
 
